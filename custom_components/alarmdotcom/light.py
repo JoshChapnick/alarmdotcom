@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, Literal
 
-import pyalarmdotcomajax as pyadc
+from . import pyalarmdotcomajax as pyadc
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ColorMode,
@@ -58,10 +59,12 @@ async def async_setup_entry(
 
 
 @callback
-def is_on_fn(hub: AlarmHub, light_id: str) -> bool:
+def is_on_fn(hub: AlarmHub, light_id: str) -> bool | None:
     """Return whether the light is on."""
 
-    resource = hub.api.lights[light_id]
+    resource = hub.api.lights.get(light_id)
+    if resource is None:
+        return None
     return resource.attributes.state == pyadc.light.LightState.ON
 
 
@@ -69,7 +72,9 @@ def is_on_fn(hub: AlarmHub, light_id: str) -> bool:
 def brightness_fn(hub: AlarmHub, light_id: str) -> int | None:
     """Return the brightness of the light."""
 
-    resource = hub.api.lights[light_id]
+    resource = hub.api.lights.get(light_id)
+    if resource is None:
+        return None
     return value_to_brightness(BRIGHTNESS_SCALE, resource.attributes.light_level)
 
 
@@ -116,15 +121,19 @@ async def control_fn(
     brightness = options.get(ATTR_BRIGHTNESS)
 
     try:
-        if command == "turn_on":
-            if brightness is not None:
-                await controller.set_brightness(light_id, math.ceil(brightness_to_value(BRIGHTNESS_SCALE, brightness)))
+        async with asyncio.timeout(30):  # 30-second timeout for light commands
+            if command == "turn_on":
+                if brightness is not None:
+                    await controller.set_brightness(light_id, math.ceil(brightness_to_value(BRIGHTNESS_SCALE, brightness)))
+                else:
+                    await controller.turn_on(light_id)
+            elif command == "turn_off":
+                await controller.turn_off(light_id)
             else:
-                await controller.turn_on(light_id)
-        elif command == "turn_off":
-            await controller.turn_off(light_id)
-        else:
-            raise ValueError(f"Unsupported command: {command}")
+                raise ValueError(f"Unsupported command: {command}")
+    except TimeoutError:
+        log.error("Light command %s timed out after 30 seconds", command)
+        raise
     except (pyadc.ServiceUnavailable, pyadc.UnexpectedResponse) as err:
         log.error("Failed to execute light command: %s", err)
         raise

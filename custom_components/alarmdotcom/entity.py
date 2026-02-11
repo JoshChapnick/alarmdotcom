@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-import pyalarmdotcomajax as pyadc
+from . import pyalarmdotcomajax as pyadc
 from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import (
@@ -42,7 +44,9 @@ def unique_id_fn(device_id: str, entity_name: str | None) -> str:
 def entity_name_fn(hub: AlarmHub, resource_id: str, entity_suffix: str | None) -> str | None:
     """Return device name."""
 
-    resource = hub.api.managed_devices[resource_id]
+    resource = hub.api.managed_devices.get(resource_id)
+    if resource is None:
+        return None
 
     if entity_suffix:
         return (f"{resource.name} {slug_to_title(entity_suffix)}").title()
@@ -54,7 +58,9 @@ def entity_name_fn(hub: AlarmHub, resource_id: str, entity_suffix: str | None) -
 def available_fn(hub: AlarmHub, resource_id: str) -> bool:
     """Check if device is available."""
 
-    resource = hub.api.managed_devices[resource_id]
+    resource = hub.api.managed_devices.get(resource_id)
+    if resource is None:
+        return False
 
     return (
         hub.available
@@ -71,7 +77,11 @@ def available_fn(hub: AlarmHub, resource_id: str) -> bool:
 def device_info_fn(hub: AlarmHub, resource_id: str, entity_name: str | None) -> DeviceInfo:
     """Return device information."""
 
-    resource = hub.api.managed_devices[resource_id]
+    resource = hub.api.managed_devices.get(resource_id)
+
+    # If resource is not found, return minimal device info
+    if resource is None:
+        return DeviceInfo(identifiers={(DOMAIN, resource_id)})
 
     # If not primary entity for device.
     if entity_name:
@@ -119,8 +129,8 @@ class AdcEntityDescription(
     # Optional Constants
     has_entity_name: bool = True
     """Has entity name defaults to true."""
-    should_poll: bool = False
-    """Whether entity needs to do regular checks on state."""
+    should_poll: bool = True
+    """Whether entity needs to do regular checks on state. Enabled as safety net fallback."""
 
     # Optional Functions
     available_fn: Callable[[AlarmHub, str], bool] = available_fn
@@ -141,6 +151,9 @@ class AdcEntity(Entity, Generic[AdcManagedDeviceT, AdcControllerT]):
     entity_description: AdcEntityDescription[AdcManagedDeviceT, AdcControllerT]
     controller: AdcControllerT
 
+    # Polling interval for fallback - only poll if no WebSocket update in 60 seconds
+    _POLL_SKIP_INTERVAL = 60
+
     def __init__(
         self,
         hub: AlarmHub,
@@ -157,13 +170,17 @@ class AdcEntity(Entity, Generic[AdcManagedDeviceT, AdcControllerT]):
 
         self._attr_should_poll = description.should_poll
         self._attr_available = description.available_fn(hub, resource_id)
-        self._attr_extra_state_attributes = description.extra_attrib_fn(hub.api.managed_devices[resource_id])
+        resource = hub.api.managed_devices.get(resource_id)
+        self._attr_extra_state_attributes = description.extra_attrib_fn(resource) if resource else {}
 
         entity_name = description.name if isinstance(description.name, str) else None
 
         self._attr_device_info = description.device_info_fn(hub, resource_id, entity_name)
         self._attr_unique_id = description.unique_id_fn(resource_id, entity_name)
         self._attr_name = description.entity_name_fn(hub, resource_id, entity_name)
+
+        # Initialize WebSocket update tracking for polling fallback
+        self._last_ws_update: float | None = None
 
         self.initiate_state()
 
@@ -184,11 +201,13 @@ class AdcEntity(Entity, Generic[AdcManagedDeviceT, AdcControllerT]):
         """
 
         # self.entity_description.name sometimes returns as typing.UndefinedType.
+        resource = self.hub.api.managed_devices.get(self.resource_id)
+        resource_name = resource.name if resource else self.resource_id
         log.debug(
             "Initiating state for %s",
-            f"{self.hub.api.managed_devices[self.resource_id].name} - {self.entity_description.name}"
+            f"{resource_name} - {self.entity_description.name}"
             if isinstance(self.entity_description.name, str)
-            else self.hub.api.managed_devices[self.resource_id].name,
+            else resource_name,
         )
 
         self.update_state(pyadc.ResourceEventMessage(topic=pyadc.EventBrokerTopic.RESOURCE_ADDED, id=self.resource_id))
@@ -218,9 +237,45 @@ class AdcEntity(Entity, Generic[AdcManagedDeviceT, AdcControllerT]):
         ]:
             self._attr_available = self.entity_description.available_fn(self.hub, self.resource_id)
 
-            if message.topic != pyadc.EventBrokerTopic.CONNECTION_EVENT:
-                self.update_state(message)
+            # Track last WebSocket update time for polling fallback
+            self._last_ws_update = time.monotonic()
+
+            # Always update state, including on reconnection
+            # The library refreshes device state after reconnect, so we need to read it
+            self.update_state(message)
 
             self.async_write_ha_state()
         elif message.topic == pyadc.EventBrokerTopic.RESOURCE_DELETED:
             self.hass.async_create_task(self.remove())
+
+    async def async_update(self) -> None:
+        """Periodic state refresh as fallback.
+
+        This only actually updates state if we haven't received a WebSocket update recently.
+        This acts as a safety net in case the WebSocket connection is failing silently.
+        """
+        try:
+            # Only poll if we haven't received a WebSocket update recently
+            if self._last_ws_update is not None:
+                time_since_ws_update = time.monotonic() - self._last_ws_update
+                if time_since_ws_update < self._POLL_SKIP_INTERVAL:
+                    log.debug(
+                        "Skipping poll for %s - recent WebSocket update %.1fs ago",
+                        self.resource_id,
+                        time_since_ws_update,
+                    )
+                    return
+
+            log.debug(
+                "Fallback poll for %s - no WebSocket update in %ss",
+                self.resource_id,
+                self._POLL_SKIP_INTERVAL,
+            )
+
+            resource = self.hub.api.managed_devices.get(self.resource_id)
+            if resource:
+                self._attr_available = self.entity_description.available_fn(self.hub, self.resource_id)
+                self.update_state(None)
+                self.async_write_ha_state()
+        except Exception as err:
+            log.debug("Fallback poll for %s failed: %s", self.resource_id, err)

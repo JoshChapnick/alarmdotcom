@@ -3,13 +3,14 @@
 import asyncio
 import logging
 
-import pyalarmdotcomajax as pyadc
+import aiohttp
+from . import pyalarmdotcomajax as pyadc
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
-from pyalarmdotcomajax import AlarmBridge
+from .pyalarmdotcomajax import AlarmBridge
 
 from .const import (
     CONF_MFA_TOKEN,
@@ -40,31 +41,32 @@ class AlarmHub:
 
         hass.data.setdefault(DOMAIN, {})[self.config_entry.entry_id] = {DATA_HUB: self}
 
-        self.available: bool = True
+        self._last_connected: float | None = None
 
-    # @property
-    # def available(self) -> bool:
-    #     """
-    #     Whether the Alarm.com API is available.
+    @property
+    def available(self) -> bool:
+        """
+        Whether the Alarm.com API is available.
 
-    #     This will only be true if the websocket connection is established and has not been disconnected
-    #     for more than 60 seconds. This is to prevent the system from being marked as unavailable if the
-    #     connection is temporarily lost.
-    #     """
-    #     # If never connected, treat as unavailable.
-    #     ws = self.api.ws_controller
-    #     if ws.connected:
-    #         # Update last connected time
-    #         self._last_connected = asyncio.get_event_loop().time()
-    #         return True
+        This will only be true if the websocket connection is established and has not been disconnected
+        for more than 60 seconds. This is to prevent the system from being marked as unavailable if the
+        connection is temporarily lost.
+        """
+        import time
 
-    #     # If never set, treat as unavailable
-    #     last_connected = getattr(self, "_last_connected", None)
-    #     if last_connected is None:
-    #         return False
+        ws = self.api.ws_controller
+        current_time = time.monotonic()
+        if ws.connected:
+            # Update last connected time
+            self._last_connected = current_time
+            return True
 
-    #     # If disconnected for less than 60 seconds, still available
-    #     return bool(asyncio.get_event_loop().time() - last_connected < 60)
+        # If never set, treat as unavailable
+        if self._last_connected is None:
+            return False
+
+        # If disconnected for less than 60 seconds, still available (grace period)
+        return bool(current_time - self._last_connected < 60)
 
     async def login(self) -> bool:
         """Log in to alarm.com."""
@@ -102,8 +104,8 @@ class AlarmHub:
             raise ConfigEntryNotReady("Could not connect to Alarm.com.") from err
         except pyadc.AuthenticationException as err:
             raise ConfigEntryAuthFailed from err
-        except Exception:
-            log.exception("Unexpected error during Alarm.com initialization.")
+        except (pyadc.AlarmdotcomException, aiohttp.ClientError) as err:
+            log.exception("Error during Alarm.com initialization: %s", err)
             return False
         finally:
             if not setup_ok:

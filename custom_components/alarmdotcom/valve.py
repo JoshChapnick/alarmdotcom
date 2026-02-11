@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic
 
-import pyalarmdotcomajax as pyadc
+from . import pyalarmdotcomajax as pyadc
 from homeassistant.components.valve import (
     ValveDeviceClass,
     ValveEntity,
@@ -85,12 +86,16 @@ async def control_fn(
 ) -> None:
     """Open or close the valve."""
     try:
-        if command == "open":
-            await controller.open(valve_id)
-        elif command == "close":
-            await controller.close(valve_id)
-        else:
-            raise ValueError(f"Unsupported command: {command}")
+        async with asyncio.timeout(30):  # 30-second timeout for valve commands
+            if command == "open":
+                await controller.open(valve_id)
+            elif command == "close":
+                await controller.close(valve_id)
+            else:
+                raise ValueError(f"Unsupported command: {command}")
+    except TimeoutError:
+        log.error("Valve command %s timed out after 30 seconds", command)
+        raise
     except (pyadc.ServiceUnavailable, pyadc.UnexpectedResponse) as err:
         log.error("Failed to execute valve command: %s", err)
         raise

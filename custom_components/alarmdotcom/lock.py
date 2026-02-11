@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic
 
-import pyalarmdotcomajax as pyadc
+from . import pyalarmdotcomajax as pyadc
 from homeassistant.components.lock import (
     LockEntity,
     LockEntityDescription,
@@ -56,18 +57,22 @@ async def async_setup_entry(
 
 
 @callback
-def is_locked_fn(hub: AlarmHub, lock_id: str) -> bool:
+def is_locked_fn(hub: AlarmHub, lock_id: str) -> bool | None:
     """Return whether the lock is locked."""
 
-    resource = hub.api.locks[lock_id]
+    resource = hub.api.locks.get(lock_id)
+    if resource is None:
+        return None
     return resource.attributes.state == pyadc.lock.LockState.LOCKED
 
 
 @callback
-def is_locking_fn(hub: AlarmHub, lock_id: str) -> bool:
+def is_locking_fn(hub: AlarmHub, lock_id: str) -> bool | None:
     """Return whether the lock is in the process of locking."""
 
-    resource = hub.api.locks[lock_id]
+    resource = hub.api.locks.get(lock_id)
+    if resource is None:
+        return None
     return (
         resource.attributes.state != pyadc.lock.LockState.LOCKED
         and resource.attributes.desired_state == pyadc.lock.LockState.LOCKED
@@ -75,10 +80,12 @@ def is_locking_fn(hub: AlarmHub, lock_id: str) -> bool:
 
 
 @callback
-def is_unlocking_fn(hub: AlarmHub, lock_id: str) -> bool:
+def is_unlocking_fn(hub: AlarmHub, lock_id: str) -> bool | None:
     """Return whether the lock is in the process of unlocking."""
 
-    resource = hub.api.locks[lock_id]
+    resource = hub.api.locks.get(lock_id)
+    if resource is None:
+        return None
     return (
         resource.attributes.state != pyadc.lock.LockState.UNLOCKED
         and resource.attributes.desired_state == pyadc.lock.LockState.UNLOCKED
@@ -104,12 +111,16 @@ async def control_fn(
     """Lock or unlock the device."""
 
     try:
-        if command == "lock":
-            await controller.lock(lock_id)
-        elif command == "unlock":
-            await controller.unlock(lock_id)
-        else:
-            raise ValueError(f"Unsupported command: {command}")
+        async with asyncio.timeout(30):  # 30-second timeout for lock commands
+            if command == "lock":
+                await controller.lock(lock_id)
+            elif command == "unlock":
+                await controller.unlock(lock_id)
+            else:
+                raise ValueError(f"Unsupported command: {command}")
+    except TimeoutError:
+        log.error("Lock command %s timed out after 30 seconds", command)
+        raise
     except (pyadc.ServiceUnavailable, pyadc.UnexpectedResponse) as err:
         log.error("Failed to execute lock command: %s", err)
         raise

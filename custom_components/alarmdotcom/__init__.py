@@ -3,7 +3,7 @@
 import logging
 
 import aiohttp
-import pyalarmdotcomajax as pyadc
+from . import pyalarmdotcomajax as pyadc
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
@@ -24,6 +24,8 @@ from .const import (
 from .hub import AlarmHub
 
 LOGGER = logging.getLogger(__name__)
+
+DATA_DEBUG_LISTENER_UNSUB = "debug_listener_unsub"
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
@@ -60,14 +62,24 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
             )
             return
 
-        LOGGER.warning(
-            "ALARM.COM DEBUG DATA FOR %s: %s",
-            str(event_resource.attributes.description).upper(),
-            event_resource.api_resource.to_json(),
-        )
+        try:
+            description = getattr(event_resource.attributes, "description", "Unknown")
+            resource_json = event_resource.api_resource.to_json()
+            LOGGER.warning(
+                "ALARM.COM DEBUG DATA FOR %s: %s",
+                str(description).upper(),
+                resource_json,
+            )
+        except (AttributeError, TypeError) as ex:
+            LOGGER.warning(
+                "ALARM.COM DEBUG DATA FOR %s: Error accessing resource data: %s",
+                str(event.data.get("resource_id")).upper(),
+                ex,
+            )
 
-    # Listen for debug entity requests
-    hass.bus.async_listen(DEBUG_REQ_EVENT, handle_alarmdotcom_debug_request_event)
+    # Listen for debug entity requests and store the unsubscribe callback
+    debug_unsub = hass.bus.async_listen(DEBUG_REQ_EVENT, handle_alarmdotcom_debug_request_event)
+    hass.data[DOMAIN][config_entry.entry_id][DATA_DEBUG_LISTENER_UNSUB] = debug_unsub
 
     LOGGER.info("%s: Finished initializing Alarmdotcom from config entry.", __name__)
 
@@ -222,7 +234,12 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
 async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Unload a config entry."""
 
-    hub: AlarmHub = hass.data[DOMAIN].pop(config_entry.entry_id)[DATA_HUB]
+    entry_data = hass.data[DOMAIN].pop(config_entry.entry_id)
+    hub: AlarmHub = entry_data[DATA_HUB]
+
+    # Unsubscribe from debug event listener
+    if debug_unsub := entry_data.get(DATA_DEBUG_LISTENER_UNSUB):
+        debug_unsub()
 
     unload_success = await hub.close()
 

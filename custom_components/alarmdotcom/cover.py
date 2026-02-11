@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic
 
-import pyalarmdotcomajax as pyadc
+from . import pyalarmdotcomajax as pyadc
 from homeassistant.components.cover import (
     CoverDeviceClass,
     CoverEntity,
@@ -147,12 +148,16 @@ async def control_fn(
         raise ValueError(f"Resource {door_id} not found in controller")
 
     try:
-        if command == "open":
-            await controller.open(door_id)
-        elif command == "close":
-            await controller.close(door_id)
-        else:
-            raise ValueError(f"Unsupported command: {command}")
+        async with asyncio.timeout(30):  # 30-second timeout for cover commands
+            if command == "open":
+                await controller.open(door_id)
+            elif command == "close":
+                await controller.close(door_id)
+            else:
+                raise ValueError(f"Unsupported command: {command}")
+    except TimeoutError:
+        log.error("Cover command %s timed out after 30 seconds", command)
+        raise
     except (pyadc.ServiceUnavailable, pyadc.UnexpectedResponse) as err:
         log.error("Failed to execute garage door command: %s", err)
         raise

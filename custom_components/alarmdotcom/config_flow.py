@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import aiohttp
 import async_timeout
-import pyalarmdotcomajax as pyadc
+from . import pyalarmdotcomajax as pyadc
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigFlowResult
@@ -47,7 +47,7 @@ LegacyArmingOptions = Literal["home", "away", "true", "false"]
 class ADCFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a Alarmdotcom config flow."""
 
-    VERSION = 4
+    VERSION = 5
 
     def __init__(self) -> None:
         """Initialize the Alarmdotcom flow."""
@@ -119,8 +119,8 @@ class ADCFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                         __name__,
                     )
                     errors["base"] = "invalid_auth"
-                except Exception:
-                    LOGGER.exception("Got error while initializing Alarm.com.")
+                except (pyadc.AlarmdotcomException, aiohttp.ClientError) as ex:
+                    LOGGER.exception("Got error while initializing Alarm.com: %s", ex)
                     errors["base"] = "unknown"
                 else:
                     return await self.async_step_final()
@@ -155,11 +155,13 @@ class ADCFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         errors = {}
 
         if user_input is not None:
-            self.otp_method = pyadc.OtpType(
-                {otp_type.name: otp_type.value for otp_type in pyadc.OtpType}.get(
-                    user_input[CONF_OTP_METHOD]
-                )
-            )
+            otp_type_map = {otp_type.name: otp_type.value for otp_type in pyadc.OtpType}
+            otp_value = otp_type_map.get(user_input[CONF_OTP_METHOD])
+            if otp_value is None:
+                LOGGER.error("Invalid OTP method selected: %s", user_input[CONF_OTP_METHOD])
+                errors["base"] = "invalid_otp"
+                return self.async_show_form(step_id="otp_select_method", errors=errors, last_step=False)
+            self.otp_method = pyadc.OtpType(otp_value)
             if self.otp_method in (pyadc.OtpType.email, pyadc.OtpType.sms):
                 # Ask Alarm.com to send OTP if selected method is EMAIL or SMS.
                 LOGGER.debug(
